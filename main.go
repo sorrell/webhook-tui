@@ -101,6 +101,10 @@ var (
 
 	lineNumberStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("239")) // dim gray
+
+	searchHighlightStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("226")). // yellow background
+				Foreground(lipgloss.Color("0"))    // black text
 )
 
 // WebhookPayload represents an incoming webhook
@@ -169,6 +173,15 @@ type Model struct {
 	height         int
 
 	tunnelCmd      *exec.Cmd
+
+	// Search in detail view
+	searchMode       bool
+	searchInput      textinput.Model
+	searchQuery      string
+	searchMatches    []int  // line numbers with matches
+	searchMatchIdx   int    // current match index
+	detailContent    string // raw content for searching
+	detailGutterWidth int   // gutter width for line numbers
 }
 
 // Messages
@@ -320,6 +333,12 @@ func initialModel() Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
+	searchInput := textinput.New()
+	searchInput.Placeholder = ""
+	searchInput.CharLimit = 100
+	searchInput.Width = 30
+	searchInput.Prompt = "/"
+
 	return Model{
 		state:          StateSetup,
 		portInput:      portInput,
@@ -333,6 +352,7 @@ func initialModel() Model {
 		viewMode:       ViewModeTable, // Table view by default
 		currentPage:    0,
 		tunnelTimeout:  defaultTunnelTimeout,
+		searchInput:    searchInput,
 	}
 }
 
@@ -491,6 +511,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle search mode input first
+		if m.searchMode {
+			switch msg.String() {
+			case "enter":
+				// Execute search
+				m.searchMode = false
+				m.searchQuery = m.searchInput.Value()
+				m.searchInput.Blur()
+				if m.searchQuery != "" {
+					m.findSearchMatches()
+					m.updateDetailViewport() // Re-render with highlighting
+					if len(m.searchMatches) > 0 {
+						m.searchMatchIdx = 0
+						m.viewport.SetYOffset(m.searchMatches[0])
+					}
+					cmds = append(cmds, viewport.Sync(m.viewport))
+				}
+				return m, tea.Batch(cmds...)
+			case "esc":
+				// Cancel search
+				m.searchMode = false
+				m.searchInput.Blur()
+				m.searchInput.SetValue("")
+				// Clear highlighting
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.updateDetailViewport()
+				cmds = append(cmds, viewport.Sync(m.viewport))
+				return m, tea.Batch(cmds...)
+			default:
+				// Pass to search input
+				var cmd tea.Cmd
+				m.searchInput, cmd = m.searchInput.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.tunnelCmd != nil && m.tunnelCmd.Process != nil {
@@ -551,19 +608,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Set viewport content for the selected webhook
 				content := m.buildDetailContent()
 				// Calculate line number gutter width (4 digits + " │ " = 7 chars)
-				gutterWidth := 4
-				gutterTotal := gutterWidth + 3 // " │ "
+				m.detailGutterWidth = 4
+				gutterTotal := m.detailGutterWidth + 3 // " │ "
 				// Wrap content to viewport width minus gutter
-				wrapped := wrapContent(content, m.viewport.Width-gutterTotal)
-				// Add line numbers
-				numbered := addLineNumbers(wrapped, gutterWidth)
-				m.viewport.SetContent(numbered)
+				m.detailContent = wrapContent(content, m.viewport.Width-gutterTotal)
+				// Clear any previous search
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.searchMatchIdx = 0
+				// Set viewport with line numbers
+				m.updateDetailViewport()
 				m.viewport.GotoTop()
 			}
 
 		case "esc":
 			if m.state == StateDetail {
 				m.state = StateRunning
+				// Clear search when leaving detail view
+				m.searchQuery = ""
+				m.searchMatches = nil
+				m.searchMatchIdx = 0
+			}
+
+		case "/":
+			if m.state == StateDetail {
+				m.searchMode = true
+				m.searchInput.SetValue("")
+				m.searchInput.Focus()
+				return m, textinput.Blink
+			}
+
+		case "N":
+			if m.state == StateDetail && len(m.searchMatches) > 0 {
+				// Previous match
+				m.searchMatchIdx = (m.searchMatchIdx - 1 + len(m.searchMatches)) % len(m.searchMatches)
+				m.viewport.SetYOffset(m.searchMatches[m.searchMatchIdx])
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "up", "k":
@@ -612,7 +692,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, startTunnel(m.requestedPort, m.requestedSubdomain))
 			}
 
-		case "n", "right":
+		case "n":
+			if m.state == StateDetail && len(m.searchMatches) > 0 {
+				// Next search match
+				m.searchMatchIdx = (m.searchMatchIdx + 1) % len(m.searchMatches)
+				m.viewport.SetYOffset(m.searchMatches[m.searchMatchIdx])
+				cmds = append(cmds, viewport.Sync(m.viewport))
+			} else if m.state == StateRunning && m.currentPage < m.totalPages-1 {
+				m.currentPage++
+				cmds = append(cmds, loadWebhooksFromDB(m.currentPage))
+			}
+
+		case "right":
 			if m.state == StateRunning && m.currentPage < m.totalPages-1 {
 				m.currentPage++
 				cmds = append(cmds, loadWebhooksFromDB(m.currentPage))
@@ -1080,15 +1171,162 @@ func (m Model) viewDetail() string {
 	// Viewport with scrollable content
 	b.WriteString(m.viewport.View() + "\n\n")
 
-	// Scroll indicator
+	// Scroll indicator with optional search info
 	scrollPercent := int(m.viewport.ScrollPercent() * 100)
-	scrollInfo := infoStyle.Render(fmt.Sprintf("─── %d%% ───", scrollPercent))
+	var scrollInfo string
+	if m.searchQuery != "" && len(m.searchMatches) > 0 {
+		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ─── match %d/%d for '%s' ───",
+			scrollPercent, m.searchMatchIdx+1, len(m.searchMatches), m.searchQuery))
+	} else if m.searchQuery != "" {
+		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ─── no matches for '%s' ───",
+			scrollPercent, m.searchQuery))
+	} else {
+		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ───", scrollPercent))
+	}
 	b.WriteString(scrollInfo + "\n")
 
-	// Help
-	b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • ^f/^b/^d/^u: page • g/G: top/bottom • Esc: back • q: quit"))
+	// Help or search input
+	if m.searchMode {
+		b.WriteString(m.searchInput.View())
+	} else {
+		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • Esc: back"))
+	}
 
 	return b.String()
+}
+
+// findSearchMatches finds all lines containing the search query
+func (m *Model) findSearchMatches() {
+	m.searchMatches = nil
+	if m.searchQuery == "" || m.detailContent == "" {
+		return
+	}
+
+	lines := strings.Split(m.detailContent, "\n")
+	query := strings.ToLower(m.searchQuery)
+
+	for i, line := range lines {
+		// Strip ANSI codes for searching
+		cleanLine := stripANSI(line)
+		if strings.Contains(strings.ToLower(cleanLine), query) {
+			m.searchMatches = append(m.searchMatches, i)
+		}
+	}
+}
+
+// updateDetailViewport updates the viewport content with line numbers and search highlighting
+func (m *Model) updateDetailViewport() {
+	if m.detailContent == "" {
+		return
+	}
+
+	var content string
+	if m.searchQuery != "" {
+		content = highlightSearchMatches(m.detailContent, m.searchQuery)
+	} else {
+		content = m.detailContent
+	}
+
+	numbered := addLineNumbers(content, m.detailGutterWidth)
+	m.viewport.SetContent(numbered)
+}
+
+// highlightSearchMatches highlights all occurrences of query in the content
+func highlightSearchMatches(content, query string) string {
+	if query == "" {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	var result strings.Builder
+
+	for i, line := range lines {
+		result.WriteString(highlightLineMatches(line, query))
+		if i < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
+}
+
+// highlightLineMatches highlights matches in a single line (case-insensitive)
+func highlightLineMatches(line, query string) string {
+	if query == "" {
+		return line
+	}
+
+	lowerLine := strings.ToLower(stripANSI(line))
+	lowerQuery := strings.ToLower(query)
+
+	// If no match in this line, return as-is
+	if !strings.Contains(lowerLine, lowerQuery) {
+		return line
+	}
+
+	// For lines with ANSI codes, we need to be careful
+	// Simple approach: find matches in clean text, then highlight in original
+	// This is tricky with ANSI codes, so let's do a simpler approach:
+	// Replace matches case-insensitively
+	var result strings.Builder
+	remaining := line
+
+	for len(remaining) > 0 {
+		// Find next match (case-insensitive) in the remaining string
+		cleanRemaining := strings.ToLower(stripANSI(remaining))
+		idx := strings.Index(cleanRemaining, lowerQuery)
+
+		if idx == -1 {
+			result.WriteString(remaining)
+			break
+		}
+
+		// Find the actual position in the string with ANSI codes
+		actualIdx := findActualIndex(remaining, idx)
+
+		// Write everything before the match
+		result.WriteString(remaining[:actualIdx])
+
+		// Find the end of the match (accounting for ANSI codes)
+		matchEnd := findActualIndex(remaining, idx+len(query))
+
+		// Extract and highlight the match
+		match := remaining[actualIdx:matchEnd]
+		result.WriteString(searchHighlightStyle.Render(stripANSI(match)))
+
+		remaining = remaining[matchEnd:]
+	}
+
+	return result.String()
+}
+
+// findActualIndex finds the actual byte index in a string with ANSI codes
+// given a visual character index (ignoring ANSI codes)
+func findActualIndex(s string, visualIdx int) int {
+	ansiPattern := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	actualIdx := 0
+	visualCount := 0
+
+	for actualIdx < len(s) && visualCount < visualIdx {
+		// Check if we're at the start of an ANSI sequence
+		if loc := ansiPattern.FindStringIndex(s[actualIdx:]); loc != nil && loc[0] == 0 {
+			// Skip the ANSI sequence
+			actualIdx += loc[1]
+		} else {
+			// Regular character
+			actualIdx++
+			visualCount++
+		}
+	}
+
+	return actualIdx
+}
+
+// stripANSI removes ANSI escape codes from a string
+func stripANSI(s string) string {
+	ansiPattern := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return ansiPattern.ReplaceAllString(s, "")
 }
 
 // wrapContent wraps text to the specified width while preserving ANSI escape codes
