@@ -1,0 +1,39 @@
+# Binaries
+webhook-tui
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Debug files
+/tmp/
+*.log
+
+# Local data (users should not commit their webhook database)
+# The app creates this in ~/.webhook-tui/ so it won't be in the repo anyway
