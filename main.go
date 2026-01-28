@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wrap"
 	_ "modernc.org/sqlite"
 )
 
@@ -526,7 +527,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = StateDetail
 				// Set viewport content for the selected webhook
 				content := m.buildDetailContent()
-				m.viewport.SetContent(content)
+				// Wrap content to viewport width so line count matches visual lines
+				// Use hard wrap with ANSI awareness
+				wrapped := wrapContent(content, m.viewport.Width)
+				m.viewport.SetContent(wrapped)
 				m.viewport.GotoTop()
 			}
 
@@ -643,13 +647,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// Viewport height accounts for: header+blank (2) + blanks after viewport (2) + scroll indicator (1) + help (1) = 6 lines
 		if !m.viewportReady {
-			m.viewport = viewport.New(msg.Width-4, msg.Height-10)
+			m.viewport = viewport.New(msg.Width-4, msg.Height-6)
 			m.viewport.HighPerformanceRendering = false
 			m.viewportReady = true
 		} else {
 			m.viewport.Width = msg.Width - 4
-			m.viewport.Height = msg.Height - 10
+			m.viewport.Height = msg.Height - 6
 		}
 
 	case publicIPMsg:
@@ -1051,6 +1056,12 @@ func (m Model) viewDetail() string {
 	b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • ^f/^b/^d/^u: page • g/G: top/bottom • Esc: back • q: quit"))
 
 	return b.String()
+}
+
+// wrapContent wraps text to the specified width while preserving ANSI escape codes
+func wrapContent(content string, width int) string {
+	// wrap.String is ANSI-aware and will hard-wrap at the specified width
+	return wrap.String(content, width)
 }
 
 func methodStyle(method string) string {
