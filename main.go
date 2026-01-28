@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,28 @@ var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241")).
 			Italic(true)
+
+	// JSON syntax highlighting styles
+	jsonKeyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("81")) // cyan
+
+	jsonStringStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("114")) // green
+
+	jsonNumberStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("222")) // yellow
+
+	jsonBoolStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("212")) // magenta
+
+	jsonNullStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("244")) // gray
+
+	jsonBracketStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252")) // light gray
+
+	lineNumberStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("239")) // dim gray
 )
 
 // WebhookPayload represents an incoming webhook
@@ -527,10 +550,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = StateDetail
 				// Set viewport content for the selected webhook
 				content := m.buildDetailContent()
-				// Wrap content to viewport width so line count matches visual lines
-				// Use hard wrap with ANSI awareness
-				wrapped := wrapContent(content, m.viewport.Width)
-				m.viewport.SetContent(wrapped)
+				// Calculate line number gutter width (4 digits + " │ " = 7 chars)
+				gutterWidth := 4
+				gutterTotal := gutterWidth + 3 // " │ "
+				// Wrap content to viewport width minus gutter
+				wrapped := wrapContent(content, m.viewport.Width-gutterTotal)
+				// Add line numbers
+				numbered := addLineNumbers(wrapped, gutterWidth)
+				m.viewport.SetContent(numbered)
 				m.viewport.GotoTop()
 			}
 
@@ -543,18 +570,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == StateRunning && m.selectedIdx > 0 {
 				m.selectedIdx--
 			} else if m.state == StateDetail {
-				var cmd tea.Cmd
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
+				m.viewport.LineUp(1)
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "down", "j":
 			if m.state == StateRunning && m.selectedIdx < len(m.webhooks)-1 {
 				m.selectedIdx++
 			} else if m.state == StateDetail {
-				var cmd tea.Cmd
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
+				m.viewport.LineDown(1)
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "c":
@@ -602,36 +627,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "pgup":
 			if m.state == StateDetail {
 				m.viewport.HalfViewUp()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "pgdown":
 			if m.state == StateDetail {
 				m.viewport.HalfViewDown()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "ctrl+f":
 			if m.state == StateDetail {
 				m.viewport.ViewDown()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "ctrl+b":
 			if m.state == StateDetail {
 				m.viewport.ViewUp()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "ctrl+d":
 			if m.state == StateDetail {
 				m.viewport.HalfViewDown()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "ctrl+u":
 			if m.state == StateDetail {
 				m.viewport.HalfViewUp()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
 		case "G":
 			if m.state == StateDetail {
 				m.viewport.GotoBottom()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			} else if m.state == StateRunning && len(m.webhooks) > 0 {
 				m.selectedIdx = len(m.webhooks) - 1
 			}
@@ -639,6 +671,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "g":
 			if m.state == StateDetail {
 				m.viewport.GotoTop()
+				cmds = append(cmds, viewport.Sync(m.viewport))
 			} else if m.state == StateRunning && len(m.webhooks) > 0 {
 				m.selectedIdx = 0
 			}
@@ -1019,7 +1052,7 @@ func (m Model) buildDetailContent() string {
 	if wh.BodyJSON != nil {
 		prettyJSON, err := json.MarshalIndent(wh.BodyJSON, "", "  ")
 		if err == nil {
-			b.WriteString(bodyStyle.Render(string(prettyJSON)) + "\n")
+			b.WriteString(highlightJSON(string(prettyJSON)) + "\n")
 		} else {
 			b.WriteString(bodyStyle.Render(wh.Body) + "\n")
 		}
@@ -1062,6 +1095,122 @@ func (m Model) viewDetail() string {
 func wrapContent(content string, width int) string {
 	// wrap.String is ANSI-aware and will hard-wrap at the specified width
 	return wrap.String(content, width)
+}
+
+// highlightJSON applies syntax highlighting to JSON text
+func highlightJSON(jsonStr string) string {
+	var result strings.Builder
+	lines := strings.Split(jsonStr, "\n")
+
+	for i, line := range lines {
+		result.WriteString(highlightJSONLine(line))
+		if i < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
+}
+
+// highlightJSONLine highlights a single line of JSON
+func highlightJSONLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	indent := line[:len(line)-len(trimmed)]
+
+	// Empty or whitespace-only line
+	if trimmed == "" {
+		return line
+	}
+
+	// Bracket-only lines
+	if trimmed == "{" || trimmed == "}" || trimmed == "[" || trimmed == "]" ||
+		trimmed == "{," || trimmed == "}," || trimmed == "[," || trimmed == "]," {
+		bracket := strings.TrimSuffix(trimmed, ",")
+		comma := ""
+		if strings.HasSuffix(trimmed, ",") {
+			comma = ","
+		}
+		return indent + jsonBracketStyle.Render(bracket) + comma
+	}
+
+	// Check if line has a key (starts with ")
+	if strings.HasPrefix(trimmed, "\"") {
+		colonIdx := strings.Index(trimmed, "\":")
+		if colonIdx > 0 {
+			// This is a key: value line
+			key := trimmed[:colonIdx+1]
+			rest := trimmed[colonIdx+2:] // skip ":
+
+			var result strings.Builder
+			result.WriteString(indent)
+			result.WriteString(jsonKeyStyle.Render(key))
+			result.WriteString(": ")
+
+			value := strings.TrimSpace(rest)
+			result.WriteString(highlightJSONValue(value))
+			return result.String()
+		}
+	}
+
+	// Array element (string, number, etc.)
+	return indent + highlightJSONValue(trimmed)
+}
+
+// highlightJSONValue highlights a JSON value
+func highlightJSONValue(value string) string {
+	// Remove trailing comma for analysis
+	hasComma := strings.HasSuffix(value, ",")
+	cleanValue := strings.TrimSuffix(value, ",")
+	comma := ""
+	if hasComma {
+		comma = ","
+	}
+
+	// String value
+	if strings.HasPrefix(cleanValue, "\"") && strings.HasSuffix(cleanValue, "\"") {
+		return jsonStringStyle.Render(cleanValue) + comma
+	}
+
+	// Boolean
+	if cleanValue == "true" || cleanValue == "false" {
+		return jsonBoolStyle.Render(cleanValue) + comma
+	}
+
+	// Null
+	if cleanValue == "null" {
+		return jsonNullStyle.Render(cleanValue) + comma
+	}
+
+	// Number (int or float)
+	if regexp.MustCompile(`^-?\d+\.?\d*([eE][+-]?\d+)?$`).MatchString(cleanValue) {
+		return jsonNumberStyle.Render(cleanValue) + comma
+	}
+
+	// Array/object start
+	if cleanValue == "[" || cleanValue == "{" {
+		return jsonBracketStyle.Render(cleanValue) + comma
+	}
+
+	// Default - return as-is
+	return value
+}
+
+// addLineNumbers adds vim-style line numbers to content
+func addLineNumbers(content string, gutterWidth int) string {
+	lines := strings.Split(content, "\n")
+	var result strings.Builder
+
+	for i, line := range lines {
+		lineNum := fmt.Sprintf("%*d", gutterWidth, i+1)
+		result.WriteString(lineNumberStyle.Render(lineNum))
+		result.WriteString(" │ ")
+		result.WriteString(line)
+		if i < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
 }
 
 func methodStyle(method string) string {
