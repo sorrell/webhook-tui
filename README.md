@@ -1,6 +1,6 @@
 # Webhook TUI
 
-![Webhook TUI Screenshot](https://shottr.cc/s/2hs7/SCR-20260128-ephp.png)
+![Webhook TUI Screenshot](assets/screenshot.png)
 
 A terminal-based webhook listener with localtunnel integration, SQLite persistence, and a clean TUI interface.
 
