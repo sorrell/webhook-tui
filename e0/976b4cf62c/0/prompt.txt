@@ -1,0 +1,21 @@
+sometimes i see repeating lines in the pager. look at 29, 30, 31 repeating
+
+---
+
+[Image: source: /Users/sorrell/Library/Containers/cc.ffitch.shottr/Data/tmp/cc.ffitch.shottr/SCR-20260212-jhda.png]
+
+---
+
+those were added because without them i cant scroll back up. look how line 16 is next to line 22
+
+---
+
+[Image: source: /Users/sorrell/Library/Containers/cc.ffitch.shottr/Data/tmp/cc.ffitch.shottr/SCR-20260212-jpwl.png]
+
+---
+
+should we create a gitignore to ignore .claude and .entire or not
+
+---
+
+yes
