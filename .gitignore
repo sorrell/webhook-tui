@@ -18,9 +18,11 @@ go.work
 # Dependency directories
 vendor/
 
-# IDE
+# IDE / tools
 .idea/
 .vscode/
+.claude/
+.entire/
 *.swp
 *.swo
 *~

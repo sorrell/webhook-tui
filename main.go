@@ -526,7 +526,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.searchMatchIdx = 0
 						m.viewport.SetYOffset(m.searchMatches[0])
 					}
-					cmds = append(cmds, viewport.Sync(m.viewport))
+					cmds = append(cmds, tea.ClearScreen)
 				}
 				return m, tea.Batch(cmds...)
 			case "esc":
@@ -538,7 +538,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searchQuery = ""
 				m.searchMatches = nil
 				m.updateDetailViewport()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 				return m, tea.Batch(cmds...)
 			default:
 				// Pass to search input
@@ -643,7 +643,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Previous match
 				m.searchMatchIdx = (m.searchMatchIdx - 1 + len(m.searchMatches)) % len(m.searchMatches)
 				m.viewport.SetYOffset(m.searchMatches[m.searchMatchIdx])
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "up", "k":
@@ -651,7 +651,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedIdx--
 			} else if m.state == StateDetail {
 				m.viewport.LineUp(1)
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "down", "j":
@@ -659,7 +659,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedIdx++
 			} else if m.state == StateDetail {
 				m.viewport.LineDown(1)
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "c":
@@ -697,7 +697,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Next search match
 				m.searchMatchIdx = (m.searchMatchIdx + 1) % len(m.searchMatches)
 				m.viewport.SetYOffset(m.searchMatches[m.searchMatchIdx])
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			} else if m.state == StateRunning && m.currentPage < m.totalPages-1 {
 				m.currentPage++
 				cmds = append(cmds, loadWebhooksFromDB(m.currentPage))
@@ -718,43 +718,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "pgup":
 			if m.state == StateDetail {
 				m.viewport.HalfViewUp()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "pgdown":
 			if m.state == StateDetail {
 				m.viewport.HalfViewDown()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "ctrl+f":
 			if m.state == StateDetail {
 				m.viewport.ViewDown()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "ctrl+b":
 			if m.state == StateDetail {
 				m.viewport.ViewUp()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "ctrl+d":
 			if m.state == StateDetail {
 				m.viewport.HalfViewDown()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "ctrl+u":
 			if m.state == StateDetail {
 				m.viewport.HalfViewUp()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			}
 
 		case "G":
 			if m.state == StateDetail {
 				m.viewport.GotoBottom()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			} else if m.state == StateRunning && len(m.webhooks) > 0 {
 				m.selectedIdx = len(m.webhooks) - 1
 			}
@@ -762,7 +762,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "g":
 			if m.state == StateDetail {
 				m.viewport.GotoTop()
-				cmds = append(cmds, viewport.Sync(m.viewport))
+				cmds = append(cmds, tea.ClearScreen)
 			} else if m.state == StateRunning && len(m.webhooks) > 0 {
 				m.selectedIdx = 0
 			}
