@@ -3,8 +3,9 @@
   "checkpoint_id": "f755756000aa",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 1,
+  "checkpoints_count": 5,
   "files_touched": [
+    "README.md",
     "main.go"
   ],
   "sessions": [
@@ -14,13 +15,20 @@
       "context": "/f7/55756000aa/0/context.md",
       "content_hash": "/f7/55756000aa/0/content_hash.txt",
       "prompt": "/f7/55756000aa/0/prompt.txt"
+    },
+    {
+      "metadata": "/f7/55756000aa/1/metadata.json",
+      "transcript": "/f7/55756000aa/1/full.jsonl",
+      "context": "/f7/55756000aa/1/context.md",
+      "content_hash": "/f7/55756000aa/1/content_hash.txt",
+      "prompt": "/f7/55756000aa/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 11,
-    "cache_creation_tokens": 8877,
-    "cache_read_tokens": 221350,
-    "output_tokens": 2774,
-    "api_call_count": 9
+    "input_tokens": 66,
+    "cache_creation_tokens": 52586,
+    "cache_read_tokens": 2371566,
+    "output_tokens": 13528,
+    "api_call_count": 54
   }
 }

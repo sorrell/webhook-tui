@@ -1,0 +1,95 @@
+Implement the following plan:
+
+# Webhook Signature Verification Feature
+
+## Context
+When webhooks include signature headers (e.g., `X-Hub-Signature-256`, `Stripe-Signature`), users need a way to verify the signature against the raw body using their webhook secret. This feature adds an interactive command in the detail view to test webhook signatures.
+
+## File to Modify
+- `/Users/sorrell/src/tools/webhook-tui/main.go` (single-file app)
+
+## Implementation
+
+### 1. Add New State Fields to Model (~line 188)
+- `signatureMode bool` — whether we're in signature verification mode
+- `signatureStep int` — tracks which step of the flow (0=entering secret, 1=choosing algorithm, 2=showing result)
+- `secretInput textinput.Model` — text input for the webhook secret
+- `signatureAlgo string` — detected or selected algorithm (sha1, sha256, sha512)
+- `signatureResult string` — result message to display
+- `signatureHeader string` — the header name containing the signature
+- `signatureValue string` — the expected signature value from the header
+- `algoChoices []string` — available algorithms when user must choose
+- `algoSelectedIdx int` — cursor for algorithm selection
+
+### 2. Initialize secretInput in `initialModel()` (~line 339)
+Follow existing pattern (like searchInput): create a `textinput.New()`, set placeholder to "Enter webhook secret", set EchoMode to password, set width.
+
+### 3. Add Signature Detection Helper Function
+`detectSignatureHeader(headers map[string]string) (headerName, algo, sigValue string)`
+- Scan headers for known signature patterns:
+  - `X-Hub-Signature-256` → algo=sha256, parse `sha256=<hex>`
+  - `X-Hub-Signature` → algo=sha1, parse `sha1=<hex>`
+  - Headers containing "signature" (case-insensitive) → attempt to parse `algo=<hex>` format
+- Returns the header name, detected algorithm (or ""), and the signature value
+
+### 4. Add HMAC Computation Helper
+`computeHMAC(algo, secret, body string) (string, error)`
+- Support sha1, sha256, sha512
+- Use `crypto/hmac` + `crypto/sha1`, `crypto/sha256`, `crypto/sha512`
+- Return hex-encoded result
+
+### 5. Handle Keybinding `s` in Detail View (~line 786)
+- When `s` is pressed in `StateDetail`:
+  - Call `detectSignatureHeader()` on current webhook's headers
+  - If no signature header found, show a brief message ("No signature header found")
+  - If signature found with detected algo, go straight to secret input (step 0)
+  - If signature found but no algo detected, go to algorithm selection (step 1 first, then step 0)
+  - Set `signatureMode = true`, focus `secretInput`
+
+### 6. Handle signatureMode Input in Update() (~line 517, before main key switch)
+Similar pattern to `searchMode`:
+- **Step 0 (secret input):**
+  - `Enter` → compute HMAC, compare with signature, show result (step 2)
+  - `Esc` → cancel, exit signatureMode
+- **Step 1 (algorithm selection):**
+  - `j`/`k`/`↑`/`↓` → navigate choices
+  - `Enter` → select algorithm, proceed to step 0
+  - `Esc` → cancel
+- **Step 2 (result display):**
+  - Any key → exit signatureMode
+- Update `secretInput` each frame when in signatureMode
+
+### 7. Render Signature Mode in View()
+- In the detail view rendering, when `signatureMode` is true, overlay a prompt:
+  - Step 0: Show "Verify Signature (header: X-Hub-Signature-256)" + secret input field
+  - Step 1: Show algorithm choice list with cursor
+  - Step 2: Show match/mismatch result with color (green=match, red=mismatch), show computed vs expected
+
+### 8. Add Help Text
+- Add `s` to the detail view help bar (~line 1112): `s:verify sig`
+
+## Verification
+- Run the app, send a webhook with a known signature (e.g., GitHub-style `X-Hub-Signature-256`)
+- Open detail view, press `s`, enter the secret
+- Confirm match/mismatch display is correct
+- Test with no signature header → should show "no signature header found"
+- Test with unknown algorithm format → should prompt for algorithm choice
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/sorrell/.REDACTED.jsonl
+
+---
+
+have you updated the readme with the new commands for this and the new commands for viewing raw json body and copying
+
+---
+
+lets add some visual queue to let the user know when the copy command has executed successfully
+
+---
+
+the raw view doesnt allow me to scroll the page all the way down to see the body.
+
+---
+
+create a commit message of all the changes and commit
