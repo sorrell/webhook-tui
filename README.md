@@ -13,6 +13,10 @@ A terminal-based webhook listener with localtunnel integration, SQLite persisten
 - **Pagination**: Navigate through large webhook histories
 - **Multiple Views**: Table and list view modes
 - **Vim Keybindings**: Navigate with familiar vim-style keys
+- **Search**: Search within webhook detail content with `/`
+- **Raw Body Toggle**: View raw or pretty-printed JSON body
+- **Copy to Clipboard**: Copy webhook body with `y`
+- **Signature Verification**: Verify webhook signatures (HMAC-SHA1/SHA256/SHA512) against a secret
 - **Public IP Display**: Shows your public IP for webhook authentication purposes
 
 ## Installation
@@ -79,6 +83,12 @@ Press `Enter` to start the server and tunnel.
 | `Ctrl+u` | Half page up |
 | `g` | Go to top |
 | `G` | Go to bottom |
+| `/` | Search within detail content |
+| `n` | Next search match |
+| `N` | Previous search match |
+| `r` | Toggle raw body view |
+| `y` | Copy body to clipboard |
+| `s` | Verify webhook signature |
 | `Esc` | Back to list |
 | `q` | Quit |
 

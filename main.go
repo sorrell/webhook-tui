@@ -1,9 +1,15 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/sha512"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -176,6 +182,7 @@ type Model struct {
 
 	// Detail view options
 	showRawBody      bool
+	statusMsg        string // temporary flash message
 
 	// Search in detail view
 	searchMode       bool
@@ -185,6 +192,17 @@ type Model struct {
 	searchMatchIdx   int    // current match index
 	detailContent    string // raw content for searching
 	detailGutterWidth int   // gutter width for line numbers
+
+	// Signature verification
+	signatureMode    bool
+	signatureStep    int    // 0=entering secret, 1=choosing algorithm, 2=showing result
+	secretInput      textinput.Model
+	signatureAlgo    string // detected or selected algorithm
+	signatureResult  string // result message to display
+	signatureHeader  string // header name containing the signature
+	signatureValue   string // expected signature value from header
+	algoChoices      []string
+	algoSelectedIdx  int
 }
 
 // Messages
@@ -204,6 +222,7 @@ type webhooksLoadedMsg struct {
 }
 type dbErrorMsg string
 type tunnelExpiredMsg struct{}
+type clearStatusMsg struct{}
 
 func initDB() error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
@@ -342,6 +361,13 @@ func initialModel() Model {
 	searchInput.Width = 30
 	searchInput.Prompt = "/"
 
+	secretInput := textinput.New()
+	secretInput.Placeholder = "Enter webhook secret"
+	secretInput.EchoMode = textinput.EchoPassword
+	secretInput.CharLimit = 256
+	secretInput.Width = 40
+	secretInput.Prompt = "Secret: "
+
 	return Model{
 		state:          StateSetup,
 		portInput:      portInput,
@@ -356,6 +382,7 @@ func initialModel() Model {
 		currentPage:    0,
 		tunnelTimeout:  defaultTunnelTimeout,
 		searchInput:    searchInput,
+		secretInput:    secretInput,
 	}
 }
 
@@ -514,6 +541,68 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle signature verification mode input first
+		if m.signatureMode {
+			switch m.signatureStep {
+			case 0: // Entering secret
+				switch msg.String() {
+				case "enter":
+					secret := m.secretInput.Value()
+					computed, err := computeHMAC(m.signatureAlgo, secret, m.webhooks[m.selectedIdx].Body)
+					if err != nil {
+						m.signatureResult = errorStyle.Render("Error: " + err.Error())
+					} else if hmac.Equal([]byte(computed), []byte(m.signatureValue)) {
+						m.signatureResult = successStyle.Render("MATCH") +
+							"\n  Computed: " + computed +
+							"\n  Expected: " + m.signatureValue
+					} else {
+						m.signatureResult = errorStyle.Render("MISMATCH") +
+							"\n  Computed: " + computed +
+							"\n  Expected: " + m.signatureValue
+					}
+					m.signatureStep = 2
+					m.secretInput.Blur()
+					return m, nil
+				case "esc":
+					m.signatureMode = false
+					m.secretInput.Blur()
+					m.secretInput.SetValue("")
+					return m, nil
+				default:
+					var cmd tea.Cmd
+					m.secretInput, cmd = m.secretInput.Update(msg)
+					return m, cmd
+				}
+			case 1: // Algorithm selection
+				switch msg.String() {
+				case "j", "down":
+					if m.algoSelectedIdx < len(m.algoChoices)-1 {
+						m.algoSelectedIdx++
+					}
+					return m, nil
+				case "k", "up":
+					if m.algoSelectedIdx > 0 {
+						m.algoSelectedIdx--
+					}
+					return m, nil
+				case "enter":
+					m.signatureAlgo = m.algoChoices[m.algoSelectedIdx]
+					m.signatureStep = 0
+					m.secretInput.SetValue("")
+					m.secretInput.Focus()
+					return m, textinput.Blink
+				case "esc":
+					m.signatureMode = false
+					return m, nil
+				}
+				return m, nil
+			case 2: // Result display
+				m.signatureMode = false
+				m.secretInput.SetValue("")
+				return m, nil
+			}
+		}
+
 		// Handle search mode input first
 		if m.searchMode {
 			switch msg.String() {
@@ -691,8 +780,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == StateDetail {
 				m.showRawBody = !m.showRawBody
 				content := m.buildDetailContent()
-				m.detailContent = content
-				m.viewport.SetContent(content)
+				gutterTotal := m.detailGutterWidth + 3
+				m.detailContent = wrapContent(content, m.viewport.Width-gutterTotal)
+				m.updateDetailViewport()
 				cmds = append(cmds, tea.ClearScreen)
 			} else if m.state == StateRunning && (m.tunnelExpired || !m.tunnelRunning) {
 				// Reconnect tunnel
@@ -706,7 +796,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				body := m.webhooks[m.selectedIdx].Body
 				cmd := exec.Command("pbcopy")
 				cmd.Stdin = strings.NewReader(body)
-				cmd.Run()
+				if err := cmd.Run(); err == nil {
+					m.statusMsg = successStyle.Render("Copied to clipboard!")
+				} else {
+					m.statusMsg = errorStyle.Render("Copy failed")
+				}
+				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+					return clearStatusMsg{}
+				})
+			}
+
+		case "s":
+			if m.state == StateDetail && m.selectedIdx < len(m.webhooks) {
+				wh := m.webhooks[m.selectedIdx]
+				headerName, algo, sigValue := detectSignatureHeader(wh.Headers)
+				if headerName == "" {
+					m.signatureMode = true
+					m.signatureStep = 2
+					m.signatureResult = errorStyle.Render("No signature header found")
+					return m, nil
+				}
+				m.signatureHeader = headerName
+				m.signatureValue = sigValue
+				m.signatureMode = true
+				m.secretInput.SetValue("")
+				if algo != "" {
+					m.signatureAlgo = algo
+					m.signatureStep = 0
+					m.secretInput.Focus()
+					return m, textinput.Blink
+				}
+				// Unknown algo — let user choose
+				m.algoChoices = []string{"sha1", "sha256", "sha512"}
+				m.algoSelectedIdx = 1 // default to sha256
+				m.signatureStep = 1
+				return m, nil
 			}
 
 		case "n":
@@ -850,6 +974,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.selectedIdx = 0
 		m.webhooksMu.Unlock()
+
+	case clearStatusMsg:
+		m.statusMsg = ""
 
 	case dbErrorMsg:
 		// Could show error in UI, for now just ignore
@@ -1131,6 +1258,60 @@ func (m Model) renderTableView() string {
 	return b.String()
 }
 
+// detectSignatureHeader scans headers for known webhook signature patterns.
+// Returns the header name, detected algorithm (or ""), and the signature value.
+func detectSignatureHeader(headers map[string]string) (headerName, algo, sigValue string) {
+	for k, v := range headers {
+		lower := strings.ToLower(k)
+		switch lower {
+		case "x-hub-signature-256":
+			if strings.HasPrefix(v, "sha256=") {
+				return k, "sha256", strings.TrimPrefix(v, "sha256=")
+			}
+			return k, "sha256", v
+		case "x-hub-signature":
+			if strings.HasPrefix(v, "sha1=") {
+				return k, "sha1", strings.TrimPrefix(v, "sha1=")
+			}
+			return k, "sha1", v
+		}
+	}
+	// Fallback: look for any header containing "signature" (case-insensitive)
+	for k, v := range headers {
+		if strings.Contains(strings.ToLower(k), "signature") {
+			// Try to parse "algo=hex" format
+			if idx := strings.Index(v, "="); idx > 0 {
+				prefix := strings.ToLower(v[:idx])
+				switch prefix {
+				case "sha1", "sha256", "sha512":
+					return k, prefix, v[idx+1:]
+				}
+			}
+			// Unknown format — return without algo
+			return k, "", v
+		}
+	}
+	return "", "", ""
+}
+
+// computeHMAC computes an HMAC using the given algorithm, secret, and body.
+func computeHMAC(algo, secret, body string) (string, error) {
+	var h func() hash.Hash
+	switch algo {
+	case "sha1":
+		h = sha1.New
+	case "sha256":
+		h = sha256.New
+	case "sha512":
+		h = sha512.New
+	default:
+		return "", fmt.Errorf("unsupported algorithm: %s", algo)
+	}
+	mac := hmac.New(h, []byte(secret))
+	mac.Write([]byte(body))
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
 func (m Model) buildDetailContent() string {
 	var b strings.Builder
 
@@ -1207,16 +1388,38 @@ func (m Model) viewDetail() string {
 	} else if m.searchQuery != "" {
 		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ─── no matches for '%s' ───",
 			scrollPercent, m.searchQuery))
+	} else if m.statusMsg != "" {
+		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ─── ", scrollPercent)) + m.statusMsg + infoStyle.Render(" ───")
 	} else {
 		scrollInfo = infoStyle.Render(fmt.Sprintf("─── %d%% ───", scrollPercent))
 	}
 	b.WriteString(scrollInfo + "\n")
 
-	// Help or search input
-	if m.searchMode {
+	// Help or modal input
+	if m.signatureMode {
+		switch m.signatureStep {
+		case 0:
+			b.WriteString(fmt.Sprintf("Verify Signature (%s: %s)\n", highlightStyle.Render(m.signatureHeader), m.signatureAlgo))
+			b.WriteString(m.secretInput.View())
+		case 1:
+			b.WriteString(fmt.Sprintf("Verify Signature (%s) — Choose algorithm:\n", highlightStyle.Render(m.signatureHeader)))
+			for i, choice := range m.algoChoices {
+				cursor := "  "
+				if i == m.algoSelectedIdx {
+					cursor = "> "
+					b.WriteString(highlightStyle.Render(cursor+choice) + "\n")
+				} else {
+					b.WriteString(cursor + choice + "\n")
+				}
+			}
+		case 2:
+			b.WriteString(m.signatureResult + "\n")
+			b.WriteString(infoStyle.Render("Press any key to dismiss"))
+		}
+	} else if m.searchMode {
 		b.WriteString(m.searchInput.View())
 	} else {
-		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • r: raw toggle • y: copy body • Esc: back"))
+		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • r: raw toggle • y: copy body • s: verify sig • Esc: back"))
 	}
 
 	return b.String()
