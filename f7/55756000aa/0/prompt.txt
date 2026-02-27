@@ -1,0 +1,38 @@
+Implement the following plan:
+
+# Add Raw Body Toggle & Copy to Details View
+
+## Context
+The details view currently shows the request body as pretty-printed JSON (when parseable) or raw text. We need to add:
+1. A toggle to switch between pretty-printed and raw body display
+2. A keybinding to copy the raw request body to the clipboard
+
+## Changes — `/Users/sorrell/src/tools/webhook-tui/main.go`
+
+### 1. Add `showRawBody` field to `Model` struct (~line 183)
+- Add `showRawBody bool` field to track toggle state
+
+### 2. Update `buildDetailContent()` (~line 1117)
+- When `m.showRawBody` is true, always render `wh.Body` as-is (no JSON pretty-printing)
+- When false, keep current behavior (pretty-printed JSON with syntax highlighting)
+
+### 3. Add keybindings in the `tea.KeyMsg` handler (~line 649-769)
+- **`r`** key in `StateDetail`: Toggle `showRawBody`, rebuild content, update viewport
+- **`y`** key in `StateDetail`: Copy raw body to clipboard (use `pbcopy` on macOS via `exec.Command`)
+  - Note: `r` is already used in `StateRunning` for reconnect, but not in `StateDetail`, so no conflict
+
+### 4. Update help text in `viewDetail()` (~line 1192)
+- Add `r: raw toggle • y: copy body` to the help line
+
+### 5. Update header in `viewDetail()` (~line 1169)
+- Show indicator when raw mode is active (e.g., append "[RAW]" to header)
+
+## Verification
+1. Run the app, receive a webhook with a JSON body
+2. Open details view — should show pretty-printed JSON (default)
+3. Press `r` — body should switch to raw text, header shows [RAW]
+4. Press `r` again — back to pretty-printed
+5. Press `y` — raw body should be in clipboard (verify with `pbpaste`)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/sorrell/.REDACTED.jsonl
