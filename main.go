@@ -174,6 +174,9 @@ type Model struct {
 
 	tunnelCmd      *exec.Cmd
 
+	// Detail view options
+	showRawBody      bool
+
 	// Search in detail view
 	searchMode       bool
 	searchInput      textinput.Model
@@ -685,11 +688,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
-			// Reconnect tunnel
-			if m.state == StateRunning && (m.tunnelExpired || !m.tunnelRunning) {
+			if m.state == StateDetail {
+				m.showRawBody = !m.showRawBody
+				content := m.buildDetailContent()
+				m.detailContent = content
+				m.viewport.SetContent(content)
+				cmds = append(cmds, tea.ClearScreen)
+			} else if m.state == StateRunning && (m.tunnelExpired || !m.tunnelRunning) {
+				// Reconnect tunnel
 				m.tunnelExpired = false
 				m.tunnelError = ""
 				cmds = append(cmds, startTunnel(m.requestedPort, m.requestedSubdomain))
+			}
+
+		case "y":
+			if m.state == StateDetail && m.selectedIdx < len(m.webhooks) {
+				body := m.webhooks[m.selectedIdx].Body
+				cmd := exec.Command("pbcopy")
+				cmd.Stdin = strings.NewReader(body)
+				cmd.Run()
 			}
 
 		case "n":
@@ -1140,7 +1157,13 @@ func (m Model) buildDetailContent() string {
 
 	// Body
 	b.WriteString(headerStyle.Render("Body") + "\n")
-	if wh.BodyJSON != nil {
+	if m.showRawBody {
+		if wh.Body != "" {
+			b.WriteString(bodyStyle.Render(wh.Body) + "\n")
+		} else {
+			b.WriteString(infoStyle.Render("(empty)") + "\n")
+		}
+	} else if wh.BodyJSON != nil {
 		prettyJSON, err := json.MarshalIndent(wh.BodyJSON, "", "  ")
 		if err == nil {
 			b.WriteString(highlightJSON(string(prettyJSON)) + "\n")
@@ -1166,7 +1189,11 @@ func (m Model) viewDetail() string {
 	wh := m.webhooks[m.selectedIdx]
 
 	// Header
-	b.WriteString(headerStyle.Render(fmt.Sprintf("Webhook #%d Details", wh.ID)) + "\n\n")
+	headerText := fmt.Sprintf("Webhook #%d Details", wh.ID)
+	if m.showRawBody {
+		headerText += " [RAW]"
+	}
+	b.WriteString(headerStyle.Render(headerText) + "\n\n")
 
 	// Viewport with scrollable content
 	b.WriteString(m.viewport.View() + "\n\n")
@@ -1189,7 +1216,7 @@ func (m Model) viewDetail() string {
 	if m.searchMode {
 		b.WriteString(m.searchInput.View())
 	} else {
-		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • Esc: back"))
+		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • r: raw toggle • y: copy body • Esc: back"))
 	}
 
 	return b.String()
