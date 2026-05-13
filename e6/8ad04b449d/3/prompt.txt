@@ -1,0 +1,5 @@
+it would be really nice to have a list of recent sessions to resume with those default settings so i dont have to enter the same stuff every time
+
+---
+
+yes build and dedupe
