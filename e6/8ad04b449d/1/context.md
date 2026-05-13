@@ -1,0 +1,14 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+for some reason i'm not receiving stripe webhooks anymore. does this have to do with the app automatically putting /webhook at the end of the domain? in the image you can see i received them before at the /api/v1/ route. but now it's not working. here is an image of the tui and stripe [Image #1] [Image #2]
+
+### Prompt 2
+
+[Image: source: /Users/sorrell/.claude/image-cache/2ab1cbfa-2322-4702-a3c2-0f167ad8f692/1.png]
+
+[Image: source: /Users/sorrell/.claude/image-cache/2ab1cbfa-2322-4702-a3c2-0f167ad8f692/2.png]
+
