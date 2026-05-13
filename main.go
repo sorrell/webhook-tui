@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -8,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"hash"
 	"io"
@@ -124,6 +127,23 @@ type WebhookPayload struct {
 	BodyJSON  interface{}       `json:"body_json,omitempty"`
 }
 
+// SessionConfig represents saved session settings
+type SessionConfig struct {
+	ID         int
+	LastUsed   time.Time
+	Port       string
+	Subdomain  string
+	TimeoutMin int
+	ForwardURL string
+	Provider   string
+}
+
+// Tunnel provider identifiers
+const (
+	providerCloudflared = "cloudflared"
+	providerLocaltunnel = "localtunnel"
+)
+
 // State represents the current view/state of the application
 type State int
 
@@ -161,6 +181,7 @@ type Model struct {
 	serverRunning      bool
 	requestedPort      string
 	requestedSubdomain string
+	provider           string        // tunnel provider: cloudflared or localtunnel
 	tunnelTimeout      time.Duration // how long before auto-shutdown
 	tunnelStartTime    time.Time     // when tunnel was started
 
@@ -193,6 +214,16 @@ type Model struct {
 	detailContent    string // raw content for searching
 	detailGutterWidth int   // gutter width for line numbers
 
+	// Forwarding
+	forwardURL       string
+	forwardURLInput  textinput.Model
+	forwardStatus    map[int]string // webhookID -> status string
+
+	// Recent sessions
+	recentSessions   []SessionConfig
+	selectedSession  int  // -1 = none selected
+	sessionsFocused  bool // sessions list has keyboard focus (StateSetup only)
+
 	// Signature verification
 	signatureMode    bool
 	signatureStep    int    // 0=entering secret, 1=choosing algorithm, 2=showing result
@@ -223,6 +254,11 @@ type webhooksLoadedMsg struct {
 type dbErrorMsg string
 type tunnelExpiredMsg struct{}
 type clearStatusMsg struct{}
+type forwardResultMsg struct {
+	webhookID  int
+	statusCode int
+	err        error
+}
 
 func initDB() error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
@@ -246,7 +282,32 @@ func initDB() error {
 			body_json TEXT
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+			port TEXT NOT NULL,
+			subdomain TEXT,
+			timeout_min INTEGER DEFAULT 30,
+			forward_url TEXT,
+			UNIQUE(port, subdomain, timeout_min, forward_url)
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Idempotent migration: add provider column if missing. SQLite returns
+	// "duplicate column name" when it already exists; that's fine.
+	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN provider TEXT DEFAULT 'localtunnel'`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+	return nil
 }
 
 func saveWebhookToDB(payload WebhookPayload) error {
@@ -334,10 +395,55 @@ func loadWebhooksFromDB(page int) tea.Cmd {
 	}
 }
 
+func saveSession(port, subdomain string, timeoutMin int, forwardURL, provider string) {
+	if db == nil {
+		return
+	}
+	now := time.Now().Format(time.RFC3339)
+	db.Exec(`
+		INSERT INTO sessions (port, subdomain, timeout_min, forward_url, provider, last_used)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(port, subdomain, timeout_min, forward_url)
+		DO UPDATE SET last_used = ?, provider = ?
+	`, port, subdomain, timeoutMin, forwardURL, provider, now, now, provider)
+}
+
+func loadRecentSessions() []SessionConfig {
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(`
+		SELECT id, last_used, port, subdomain, timeout_min, forward_url, COALESCE(provider, 'localtunnel')
+		FROM sessions
+		ORDER BY last_used DESC
+		LIMIT 5
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var sessions []SessionConfig
+	for rows.Next() {
+		var s SessionConfig
+		var lastUsed, subdomain, forwardURL, provider string
+		if err := rows.Scan(&s.ID, &lastUsed, &s.Port, &subdomain, &s.TimeoutMin, &forwardURL, &provider); err != nil {
+			continue
+		}
+		s.Subdomain = subdomain
+		s.ForwardURL = forwardURL
+		s.Provider = provider
+		if t, err := time.Parse(time.RFC3339, lastUsed); err == nil {
+			s.LastUsed = t
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions
+}
+
 func initialModel() Model {
 	portInput := textinput.New()
 	portInput.Placeholder = "8098"
-	portInput.Focus()
 	portInput.CharLimit = 5
 	portInput.Width = 20
 
@@ -361,6 +467,11 @@ func initialModel() Model {
 	searchInput.Width = 30
 	searchInput.Prompt = "/"
 
+	forwardURLInput := textinput.New()
+	forwardURLInput.Placeholder = "https://localhost:3000/webhook"
+	forwardURLInput.CharLimit = 200
+	forwardURLInput.Width = 50
+
 	secretInput := textinput.New()
 	secretInput.Placeholder = "Enter webhook secret"
 	secretInput.EchoMode = textinput.EchoPassword
@@ -368,8 +479,12 @@ func initialModel() Model {
 	secretInput.Width = 40
 	secretInput.Prompt = "Secret: "
 
-	return Model{
+	recent := loadRecentSessions()
+	hasSessions := len(recent) > 0
+
+	m := Model{
 		state:          StateSetup,
+		provider:       providerCloudflared,
 		portInput:      portInput,
 		subdomainInput: subdomainInput,
 		timeoutInput:   timeoutInput,
@@ -378,21 +493,38 @@ func initialModel() Model {
 		fetchingIP:     true,
 		webhooks:       make([]WebhookPayload, 0),
 		webhookChan:    make(chan WebhookPayload, 100),
-		viewMode:       ViewModeTable, // Table view by default
+		viewMode:       ViewModeTable,
 		currentPage:    0,
 		tunnelTimeout:  defaultTunnelTimeout,
-		searchInput:    searchInput,
-		secretInput:    secretInput,
+		searchInput:     searchInput,
+		secretInput:     secretInput,
+		forwardURLInput: forwardURLInput,
+		forwardStatus:   make(map[int]string),
+		recentSessions:  recent,
+		selectedSession: -1,
 	}
+	if hasSessions {
+		m.sessionsFocused = true
+		m.selectedSession = 0
+	} else {
+		m.portInput.Focus()
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		textinput.Blink,
 		m.spinner.Tick,
 		fetchPublicIP,
 		loadWebhooksFromDB(0), // Load previous webhooks on startup
-	)
+	}
+	// If flags skipped setup, start tunnel and server immediately
+	if m.state == StateRunning {
+		cmds = append(cmds, startTunnel(m.requestedPort, m.requestedSubdomain, m.provider))
+		cmds = append(cmds, m.startWebhookServer())
+	}
+	return tea.Batch(cmds...)
 }
 
 // Commands
@@ -415,44 +547,109 @@ func fetchPublicIP() tea.Msg {
 	return publicIPMsg(strings.TrimSpace(string(body)))
 }
 
-func startTunnel(port, subdomain string) tea.Cmd {
+func startTunnel(port, subdomain, provider string) tea.Cmd {
 	return func() tea.Msg {
-		args := []string{"localtunnel", "--port", port}
-		if subdomain != "" {
-			args = append(args, "--subdomain", subdomain)
+		switch provider {
+		case providerCloudflared, "":
+			return startCloudflaredTunnel(port)
+		case providerLocaltunnel:
+			return startLocaltunnel(port, subdomain)
+		default:
+			return tunnelErrorMsg(fmt.Sprintf("Unknown tunnel provider: %s", provider))
 		}
+	}
+}
 
-		cmd := exec.Command("npx", args...)
-		// Set process group so we can kill all children on exit
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			return tunnelErrorMsg(fmt.Sprintf("Failed to create stdout pipe: %v", err))
+func startLocaltunnel(port, subdomain string) tea.Msg {
+	args := []string{"--yes", "localtunnel", "--port", port}
+	if subdomain != "" {
+		args = append(args, "--subdomain", subdomain)
+	}
+
+	cmd := exec.Command("npx", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to create stdout pipe: %v", err))
+	}
+
+	if err := cmd.Start(); err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to start localtunnel: %v", err))
+	}
+
+	// localtunnel prints: "your url is: https://xxx.loca.lt"
+	buf := make([]byte, 1024)
+	n, err := stdout.Read(buf)
+	if err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to read tunnel URL: %v", err))
+	}
+
+	output := string(buf[:n])
+	url := output
+	if idx := strings.Index(output, "https://"); idx != -1 {
+		url = strings.TrimSpace(output[idx:])
+		if newline := strings.Index(url, "\n"); newline != -1 {
+			url = url[:newline]
 		}
+	}
 
-		if err := cmd.Start(); err != nil {
-			return tunnelErrorMsg(fmt.Sprintf("Failed to start localtunnel: %v", err))
-		}
+	return tunnelStartedMsg{url: url, cmd: cmd}
+}
 
-		// Read the URL from stdout
-		buf := make([]byte, 1024)
-		n, err := stdout.Read(buf)
-		if err != nil {
-			return tunnelErrorMsg(fmt.Sprintf("Failed to read tunnel URL: %v", err))
-		}
+var cloudflaredURLRe = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
 
-		output := string(buf[:n])
-		// Parse out the URL from localtunnel output
-		// Output typically looks like: "your url is: https://xxx.loca.lt"
-		url := output
-		if idx := strings.Index(output, "https://"); idx != -1 {
-			url = strings.TrimSpace(output[idx:])
-			if newline := strings.Index(url, "\n"); newline != -1 {
-				url = url[:newline]
+func startCloudflaredTunnel(port string) tea.Msg {
+	target := "http://localhost:" + port
+
+	// Prefer a system-installed cloudflared (faster than npx). Fall back to
+	// `npx --yes cloudflared` which auto-downloads the binary via the
+	// `cloudflared` npm package on first run.
+	var cmd *exec.Cmd
+	if path, err := exec.LookPath("cloudflared"); err == nil {
+		cmd = exec.Command(path, "tunnel", "--url", target, "--no-autoupdate")
+	} else {
+		cmd = exec.Command("npx", "--yes", "cloudflared", "tunnel", "--url", target, "--no-autoupdate")
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to create stdout pipe: %v", err))
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to create stderr pipe: %v", err))
+	}
+
+	if err := cmd.Start(); err != nil {
+		return tunnelErrorMsg(fmt.Sprintf("Failed to start cloudflared: %v", err))
+	}
+
+	// cloudflared writes its banner to stderr; scan both pipes for the URL.
+	urlCh := make(chan string, 2)
+	scan := func(r io.Reader) {
+		s := bufio.NewScanner(r)
+		s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for s.Scan() {
+			if m := cloudflaredURLRe.FindString(s.Text()); m != "" {
+				select {
+				case urlCh <- m:
+				default:
+				}
+				// Keep draining so the pipe doesn't block the child.
 			}
 		}
+	}
+	go scan(stdout)
+	go scan(stderr)
 
+	// First run via npx may download the binary; give it room.
+	select {
+	case url := <-urlCh:
 		return tunnelStartedMsg{url: url, cmd: cmd}
+	case <-time.After(90 * time.Second):
+		_ = cmd.Process.Kill()
+		return tunnelErrorMsg("Timed out waiting for cloudflared tunnel URL (90s). Try installing cloudflared directly: brew install cloudflared")
 	}
 }
 
@@ -534,6 +731,25 @@ func scheduleTunnelExpiration(timeout time.Duration) tea.Cmd {
 	return tea.Tick(timeout, func(t time.Time) tea.Msg {
 		return tunnelExpiredMsg{}
 	})
+}
+
+func forwardWebhook(forwardURL string, wh WebhookPayload) tea.Cmd {
+	return func() tea.Msg {
+		req, err := http.NewRequest(wh.Method, forwardURL+wh.Path, bytes.NewBufferString(wh.Body))
+		if err != nil {
+			return forwardResultMsg{webhookID: wh.ID, err: err}
+		}
+		for k, v := range wh.Headers {
+			req.Header.Set(k, v)
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return forwardResultMsg{webhookID: wh.ID, err: err}
+		}
+		defer resp.Body.Close()
+		return forwardResultMsg{webhookID: wh.ID, statusCode: resp.StatusCode}
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -641,6 +857,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "ctrl+t":
+			if m.state == StateSetup {
+				if m.provider == providerLocaltunnel {
+					m.provider = providerCloudflared
+				} else {
+					m.provider = providerLocaltunnel
+				}
+				return m, nil
+			}
+
 		case "ctrl+c", "q":
 			if m.tunnelCmd != nil && m.tunnelCmd.Process != nil {
 				// Kill the process group to also kill child processes
@@ -651,26 +877,84 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "tab", "shift+tab":
 			if m.state == StateSetup {
-				if msg.String() == "shift+tab" {
-					m.focusedInput = (m.focusedInput + 2) % 3 // Go backwards
-				} else {
-					m.focusedInput = (m.focusedInput + 1) % 3
+				hasSessions := len(m.recentSessions) > 0
+				// Build a logical position: 0 = sessions (if any), then 1..N for the
+				// four text inputs (offset by 1 when sessions exist).
+				total := 4
+				if hasSessions {
+					total = 5
 				}
-				// Update focus states
+				var pos int
+				if m.sessionsFocused {
+					pos = 0
+				} else if hasSessions {
+					pos = m.focusedInput + 1
+				} else {
+					pos = m.focusedInput
+				}
+				if msg.String() == "shift+tab" {
+					pos = (pos + total - 1) % total
+				} else {
+					pos = (pos + 1) % total
+				}
 				m.portInput.Blur()
 				m.subdomainInput.Blur()
 				m.timeoutInput.Blur()
-				switch m.focusedInput {
-				case 0:
-					m.portInput.Focus()
-				case 1:
-					m.subdomainInput.Focus()
-				case 2:
-					m.timeoutInput.Focus()
+				m.forwardURLInput.Blur()
+				if hasSessions && pos == 0 {
+					m.sessionsFocused = true
+					if m.selectedSession < 0 {
+						m.selectedSession = 0
+					}
+				} else {
+					m.sessionsFocused = false
+					if hasSessions {
+						pos--
+					}
+					m.focusedInput = pos
+					switch m.focusedInput {
+					case 0:
+						m.portInput.Focus()
+					case 1:
+						m.subdomainInput.Focus()
+					case 2:
+						m.timeoutInput.Focus()
+					case 3:
+						m.forwardURLInput.Focus()
+					}
+				}
+			}
+
+		case "1", "2", "3", "4", "5":
+			if m.state == StateSetup && m.sessionsFocused {
+				idx := int(msg.String()[0]-'0') - 1
+				if idx < len(m.recentSessions) {
+					m.selectedSession = idx
+					return m, nil
 				}
 			}
 
 		case "enter":
+			if m.state == StateSetup && m.sessionsFocused {
+				if m.selectedSession >= 0 && m.selectedSession < len(m.recentSessions) {
+					s := m.recentSessions[m.selectedSession]
+					m.portInput.SetValue(s.Port)
+					m.subdomainInput.SetValue(s.Subdomain)
+					m.timeoutInput.SetValue(strconv.Itoa(s.TimeoutMin))
+					m.forwardURLInput.SetValue(s.ForwardURL)
+					if s.Provider != "" {
+						m.provider = s.Provider
+					}
+				}
+				m.sessionsFocused = false
+				m.focusedInput = 0
+				m.portInput.Blur()
+				m.subdomainInput.Blur()
+				m.timeoutInput.Blur()
+				m.forwardURLInput.Blur()
+				m.portInput.Focus()
+				return m, nil
+			}
 			if m.state == StateSetup {
 				m.state = StateRunning
 				port := m.portInput.Value()
@@ -684,8 +968,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if timeoutStr == "" {
 					timeoutStr = "30"
 				}
+				timeoutMin := 30
 				if minutes, err := strconv.Atoi(timeoutStr); err == nil && minutes > 0 {
 					m.tunnelTimeout = time.Duration(minutes) * time.Minute
+					timeoutMin = minutes
 				} else {
 					m.tunnelTimeout = defaultTunnelTimeout
 				}
@@ -693,7 +979,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Store for display
 				m.requestedPort = port
 				m.requestedSubdomain = subdomain
-				cmds = append(cmds, startTunnel(port, subdomain))
+				m.forwardURL = strings.TrimSpace(m.forwardURLInput.Value())
+				if m.provider == "" {
+					m.provider = providerCloudflared
+				}
+				if m.provider == providerCloudflared {
+					// Quick tunnels can't pick a subdomain.
+					m.requestedSubdomain = ""
+					subdomain = ""
+				}
+
+				saveSession(port, subdomain, timeoutMin, m.forwardURL, m.provider)
+
+				cmds = append(cmds, startTunnel(port, subdomain, m.provider))
 				cmds = append(cmds, m.startWebhookServer())
 			} else if m.state == StateRunning && len(m.webhooks) > 0 {
 				m.state = StateDetail
@@ -739,7 +1037,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "up", "k":
-			if m.state == StateRunning && m.selectedIdx > 0 {
+			if m.state == StateSetup && m.sessionsFocused {
+				if m.selectedSession > 0 {
+					m.selectedSession--
+				}
+			} else if m.state == StateRunning && m.selectedIdx > 0 {
 				m.selectedIdx--
 			} else if m.state == StateDetail {
 				m.viewport.LineUp(1)
@@ -747,7 +1049,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down", "j":
-			if m.state == StateRunning && m.selectedIdx < len(m.webhooks)-1 {
+			if m.state == StateSetup && m.sessionsFocused {
+				if m.selectedSession < len(m.recentSessions)-1 {
+					m.selectedSession++
+				}
+			} else if m.state == StateRunning && m.selectedIdx < len(m.webhooks)-1 {
 				m.selectedIdx++
 			} else if m.state == StateDetail {
 				m.viewport.LineDown(1)
@@ -788,7 +1094,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Reconnect tunnel
 				m.tunnelExpired = false
 				m.tunnelError = ""
-				cmds = append(cmds, startTunnel(m.requestedPort, m.requestedSubdomain))
+				cmds = append(cmds, startTunnel(m.requestedPort, m.requestedSubdomain, m.provider))
 			}
 
 		case "y":
@@ -801,6 +1107,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.statusMsg = errorStyle.Render("Copy failed")
 				}
+				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+					return clearStatusMsg{}
+				})
+			}
+
+		case "f":
+			if m.state == StateDetail && m.forwardURL != "" && m.selectedIdx < len(m.webhooks) {
+				wh := m.webhooks[m.selectedIdx]
+				m.forwardStatus[wh.ID] = "forwarding..."
+				m.statusMsg = "Forwarding webhook #" + strconv.Itoa(wh.ID) + "..."
+				return m, tea.Batch(
+					forwardWebhook(m.forwardURL, wh),
+					tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+						return clearStatusMsg{}
+					}),
+				)
+			} else if m.state == StateDetail && m.forwardURL == "" {
+				m.statusMsg = errorStyle.Render("No forward URL configured")
 				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 					return clearStatusMsg{}
 				})
@@ -958,10 +1282,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitForWebhook(m.webhookChan))
 
 	case webhookReceivedMsg:
+		payload := WebhookPayload(msg)
 		m.webhooksMu.Lock()
-		m.webhooks = append([]WebhookPayload{WebhookPayload(msg)}, m.webhooks...)
+		m.webhooks = append([]WebhookPayload{payload}, m.webhooks...)
 		m.webhooksMu.Unlock()
 		cmds = append(cmds, waitForWebhook(m.webhookChan))
+		if m.forwardURL != "" {
+			m.forwardStatus[payload.ID] = "forwarding..."
+			cmds = append(cmds, forwardWebhook(m.forwardURL, payload))
+		}
 
 	case webhooksLoadedMsg:
 		m.webhooksMu.Lock()
@@ -975,6 +1304,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selectedIdx = 0
 		m.webhooksMu.Unlock()
 
+	case forwardResultMsg:
+		if msg.err != nil {
+			m.forwardStatus[msg.webhookID] = errorStyle.Render("✗ " + msg.err.Error())
+		} else if msg.statusCode >= 200 && msg.statusCode < 300 {
+			m.forwardStatus[msg.webhookID] = successStyle.Render(fmt.Sprintf("✓ %d", msg.statusCode))
+		} else {
+			m.forwardStatus[msg.webhookID] = errorStyle.Render(fmt.Sprintf("✗ %d", msg.statusCode))
+		}
+		// Refresh detail view if we're looking at this webhook
+		if m.state == StateDetail && m.selectedIdx < len(m.webhooks) && m.webhooks[m.selectedIdx].ID == msg.webhookID {
+			content := m.buildDetailContent()
+			gutterTotal := m.detailGutterWidth + 3
+			m.detailContent = wrapContent(content, m.viewport.Width-gutterTotal)
+			m.updateDetailViewport()
+		}
+
 	case clearStatusMsg:
 		m.statusMsg = ""
 
@@ -987,8 +1332,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 	}
 
-	// Update ALL inputs - their internal Focus state controls which accepts keyboard input
 	if m.state == StateSetup {
+		prevPort := m.portInput.Value()
+		prevSub := m.subdomainInput.Value()
+		prevTimeout := m.timeoutInput.Value()
+		prevFwd := m.forwardURLInput.Value()
+
 		var cmd tea.Cmd
 		m.portInput, cmd = m.portInput.Update(msg)
 		cmds = append(cmds, cmd)
@@ -996,6 +1345,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 		m.timeoutInput, cmd = m.timeoutInput.Update(msg)
 		cmds = append(cmds, cmd)
+		m.forwardURLInput, cmd = m.forwardURLInput.Update(msg)
+		cmds = append(cmds, cmd)
+
+		if m.selectedSession >= 0 && (m.portInput.Value() != prevPort ||
+			m.subdomainInput.Value() != prevSub || m.timeoutInput.Value() != prevTimeout ||
+			m.forwardURLInput.Value() != prevFwd) {
+			m.selectedSession = -1
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -1023,6 +1380,39 @@ func (m Model) View() string {
 func (m Model) viewSetup() string {
 	var b strings.Builder
 
+	// Recent sessions
+	if len(m.recentSessions) > 0 {
+		header := "Recent Sessions"
+		if m.sessionsFocused {
+			header += " (↑/↓ select • Enter loads)"
+		}
+		b.WriteString(headerStyle.Render(header) + "\n")
+		for i, s := range m.recentSessions {
+			arrow := "   "
+			if m.sessionsFocused && m.selectedSession == i {
+				arrow = " ▶ "
+			}
+			label := fmt.Sprintf(":%s", s.Port)
+			if s.Subdomain != "" {
+				label += fmt.Sprintf(" (%s)", s.Subdomain)
+			}
+			if s.ForwardURL != "" {
+				label += fmt.Sprintf(" → %s", s.ForwardURL)
+			}
+			provLabel := s.Provider
+			if provLabel == "" {
+				provLabel = providerLocaltunnel
+			}
+			label += fmt.Sprintf(" [%dm, %s]", s.TimeoutMin, provLabel)
+			if m.selectedSession == i {
+				b.WriteString(fmt.Sprintf("%s%s\n", arrow, highlightStyle.Render(label)))
+			} else {
+				b.WriteString(fmt.Sprintf("%s%s\n", arrow, label))
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	// Public IP section
 	b.WriteString(headerStyle.Render("Public IP Address") + "\n")
 	if m.fetchingIP {
@@ -1032,6 +1422,15 @@ func (m Model) viewSetup() string {
 		b.WriteString(infoStyle.Render("(Use this for webhook authentication if needed)") + "\n")
 	}
 	b.WriteString("\n")
+
+	// Tunnel provider
+	b.WriteString(headerStyle.Render("Tunnel Provider") + "\n")
+	provider := m.provider
+	if provider == "" {
+		provider = providerCloudflared
+	}
+	b.WriteString(highlightStyle.Render(provider) + "\n")
+	b.WriteString(infoStyle.Render("Ctrl+T toggles cloudflared ↔ localtunnel (cloudflared is recommended)") + "\n\n")
 
 	// Port input
 	b.WriteString(headerStyle.Render("Local Port") + "\n")
@@ -1043,7 +1442,11 @@ func (m Model) viewSetup() string {
 	b.WriteString(infoStyle.Render("Port for the local webhook server") + "\n\n")
 
 	// Subdomain input
-	b.WriteString(headerStyle.Render("Subdomain (optional)") + "\n")
+	subLabel := "Subdomain (optional)"
+	if provider == providerCloudflared {
+		subLabel = "Subdomain (ignored — cloudflared quick tunnels assign random)"
+	}
+	b.WriteString(headerStyle.Render(subLabel) + "\n")
 	if m.focusedInput == 1 {
 		b.WriteString(selectedStyle.Render(m.subdomainInput.View()) + "\n")
 	} else {
@@ -1060,8 +1463,21 @@ func (m Model) viewSetup() string {
 	}
 	b.WriteString(infoStyle.Render("Auto-disconnect tunnel after this many minutes (default: 30)") + "\n\n")
 
+	// Forward URL input
+	b.WriteString(headerStyle.Render("Forward URL (optional)") + "\n")
+	if m.focusedInput == 3 {
+		b.WriteString(selectedStyle.Render(m.forwardURLInput.View()) + "\n")
+	} else {
+		b.WriteString(m.forwardURLInput.View() + "\n")
+	}
+	b.WriteString(infoStyle.Render("Forward received webhooks to this URL (e.g., http://localhost:3000)") + "\n\n")
+
 	// Help
-	b.WriteString(helpStyle.Render("Tab: switch fields • Enter: start • q: quit"))
+	if m.sessionsFocused {
+		b.WriteString(helpStyle.Render("↑/↓: select session • Enter: load • Tab: fields • Ctrl+T: toggle provider • q: quit"))
+	} else {
+		b.WriteString(helpStyle.Render("Tab: switch fields • Enter: start • Ctrl+T: toggle provider • q: quit"))
+	}
 
 	return b.String()
 }
@@ -1109,15 +1525,27 @@ func (m Model) viewRunning() string {
 			countdownStyle = errorStyle // Red
 		}
 
-		b.WriteString(fmt.Sprintf("  Tunnel: %s %s\n", successStyle.Render("●"), m.tunnelURL))
-		b.WriteString(fmt.Sprintf("  Webhook URL: %s\n", highlightStyle.Render(m.tunnelURL+"/webhook")))
+		providerLabel := m.provider
+		if providerLabel == "" {
+			providerLabel = providerCloudflared
+		}
+		b.WriteString(fmt.Sprintf("  Tunnel: %s %s %s\n", successStyle.Render("●"), m.tunnelURL, infoStyle.Render("("+providerLabel+")")))
+		b.WriteString(fmt.Sprintf("  Webhook URL: %s\n", highlightStyle.Render(m.tunnelURL)))
 		b.WriteString(fmt.Sprintf("  Expires in: %s\n", countdownStyle.Render(remainingStr)))
 	} else {
+		providerLabel := m.provider
+		if providerLabel == "" {
+			providerLabel = providerCloudflared
+		}
 		subdomainInfo := ""
-		if m.requestedSubdomain != "" {
+		if m.provider == providerLocaltunnel && m.requestedSubdomain != "" {
 			subdomainInfo = fmt.Sprintf(" (subdomain: %s)", m.requestedSubdomain)
 		}
-		b.WriteString(fmt.Sprintf("  Tunnel: %s Starting localtunnel...%s\n", m.spinner.View(), subdomainInfo))
+		b.WriteString(fmt.Sprintf("  Tunnel: %s Starting %s...%s\n", m.spinner.View(), providerLabel, subdomainInfo))
+	}
+	// Forward URL
+	if m.forwardURL != "" {
+		b.WriteString(fmt.Sprintf("  Forward: %s %s\n", successStyle.Render("●"), m.forwardURL))
 	}
 	b.WriteString("\n")
 
@@ -1327,7 +1755,17 @@ func (m Model) buildDetailContent() string {
 		methodStyle(wh.Method),
 	))
 	b.WriteString(fmt.Sprintf("%s %s\n", highlightStyle.Render("Path:"), wh.Path))
-	b.WriteString(fmt.Sprintf("%s %s\n\n", highlightStyle.Render("Time:"), wh.Timestamp.Format(time.RFC3339)))
+	b.WriteString(fmt.Sprintf("%s %s\n", highlightStyle.Render("Time:"), wh.Timestamp.Format(time.RFC3339)))
+
+	// Forward status
+	if m.forwardURL != "" {
+		status := m.forwardStatus[wh.ID]
+		if status == "" {
+			status = infoStyle.Render("not forwarded")
+		}
+		b.WriteString(fmt.Sprintf("%s %s\n", highlightStyle.Render("Forward:"), status))
+	}
+	b.WriteString("\n")
 
 	// Headers
 	b.WriteString(headerStyle.Render("Headers") + "\n")
@@ -1419,7 +1857,7 @@ func (m Model) viewDetail() string {
 	} else if m.searchMode {
 		b.WriteString(m.searchInput.View())
 	} else {
-		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • r: raw toggle • y: copy body • s: verify sig • Esc: back"))
+		b.WriteString(helpStyle.Render("↑/↓/j/k: scroll • /: search • n/N: next/prev • g/G: top/bottom • r: raw • y: copy • f: forward • s: verify sig • Esc: back"))
 	}
 
 	return b.String()
@@ -1708,6 +2146,21 @@ func truncate(s string, max int) string {
 }
 
 func main() {
+	port := flag.String("port", "", "Port for the webhook server (default: 8098)")
+	subdomain := flag.String("subdomain", "", "Subdomain for the tunnel (localtunnel only)")
+	fwd := flag.String("fwd", "", "URL to forward webhooks to")
+	timeout := flag.Int("timeout", 0, "Tunnel timeout in minutes (default: 30)")
+	tunnel := flag.String("tunnel", "", "Tunnel provider: cloudflared (default) or localtunnel")
+	flag.Parse()
+
+	switch *tunnel {
+	case "", providerCloudflared, providerLocaltunnel:
+		// valid
+	default:
+		fmt.Printf("Invalid -tunnel provider %q (expected cloudflared or localtunnel)\n", *tunnel)
+		os.Exit(1)
+	}
+
 	// Initialize database
 	if err := initDB(); err != nil {
 		fmt.Printf("Failed to initialize database: %v\n", err)
@@ -1715,7 +2168,36 @@ func main() {
 	}
 	defer db.Close()
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	m := initialModel()
+
+	// If any flags provided, skip setup and go straight to running
+	if *port != "" || *subdomain != "" || *fwd != "" || *timeout != 0 || *tunnel != "" {
+		if *port == "" {
+			*port = "8098"
+		}
+		if *timeout <= 0 {
+			*timeout = 30
+		}
+		provider := *tunnel
+		if provider == "" {
+			provider = providerCloudflared
+		}
+		if provider == providerCloudflared && *subdomain != "" {
+			fmt.Println("Note: -subdomain is ignored when using cloudflared quick tunnels")
+			*subdomain = ""
+		}
+		m.state = StateRunning
+		m.portInput.SetValue(*port)
+		m.subdomainInput.SetValue(*subdomain)
+		m.requestedPort = *port
+		m.requestedSubdomain = *subdomain
+		m.provider = provider
+		m.forwardURL = strings.TrimSpace(*fwd)
+		m.tunnelTimeout = time.Duration(*timeout) * time.Minute
+		saveSession(*port, *subdomain, *timeout, m.forwardURL, provider)
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)
 		os.Exit(1)
