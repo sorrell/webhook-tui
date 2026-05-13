@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "e68ad04b449d",
+  "session_id": "1c761fb6-3e30-4f90-b933-a964073d6ee1",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-13T23:48:16.412719Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "main.go"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "212d02dc-dbdc-4b6a-92fb-af613ce1f5bf",
+  "token_usage": {
+    "input_tokens": 101,
+    "cache_creation_tokens": 178585,
+    "cache_read_tokens": 6621398,
+    "output_tokens": 38618,
+    "api_call_count": 81
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-13T23:48:16.311295Z",
+    "agent_lines": 542,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 542,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-sorrell-src-tools-webhook-tui/1c761fb6-3e30-4f90-b933-a964073d6ee1.jsonl"
+}
