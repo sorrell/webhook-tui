@@ -1110,6 +1110,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 					return clearStatusMsg{}
 				})
+			} else if m.state == StateRunning && m.tunnelURL != "" {
+				cmd := exec.Command("pbcopy")
+				cmd.Stdin = strings.NewReader(m.tunnelURL)
+				if err := cmd.Run(); err == nil {
+					m.statusMsg = successStyle.Render("Tunnel URL copied to clipboard!")
+				} else {
+					m.statusMsg = errorStyle.Render("Copy failed")
+				}
+				return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+					return clearStatusMsg{}
+				})
 			}
 
 		case "f":
@@ -1577,7 +1588,10 @@ func (m Model) viewRunning() string {
 	}
 
 	// Help
-	b.WriteString("\n" + helpStyle.Render("j/k: select • n/p: page • Enter: details • t: view • r: reconnect • l: load DB • c: clear • q: quit"))
+	b.WriteString("\n" + helpStyle.Render("j/k: select • n/p: page • Enter: details • t: view • y: copy URL • r: reconnect • l: load DB • c: clear • q: quit"))
+	if m.statusMsg != "" {
+		b.WriteString("\n" + m.statusMsg)
+	}
 
 	return b.String()
 }
